@@ -19,6 +19,7 @@
         buildInputs = [
           pkgs.nixpkgs-fmt
           pkgs.bcc
+          pkgs.python3Packages.setuptools
         ];
       };
     };

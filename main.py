@@ -1,5 +1,10 @@
 #!/usr/bin/env python
 
+from dataclasses import asdict, dataclass
+import json
+import logging
+import sys
+from typing import Optional
 from bcc import BPF
 
 program = """
@@ -68,10 +73,19 @@ TRACEPOINT_PROBE(sched, sched_process_exit) {
 // TODO: send arbitrary size
 #define ARG_SIZE 128
 
+enum execve_event_kind {
+    EXECVE_CALL = 0,
+    EXECVE_ARG = 1,
+    EXECVE_RETURN = 2,
+};
+
 struct execve_event_t {
+    u64 ts;
     u32 pid;
-    u32 task_pid;
+    int retval;
+    enum execve_event_kind kind;
     u32 argv_index;
+    char filename[NAME_MAX];
     char comm[TASK_COMM_LEN];
     char argv[ARG_SIZE];
 };
@@ -86,9 +100,13 @@ int syscall__execve(
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
     struct execve_event_t event = {};
-    event.pid = bpf_get_current_pid_tgid() >> 32;
-    event.task_pid = task->tgid;
+    event.ts = bpf_ktime_get_ns();
+    event.pid = task->tgid;
     bpf_get_current_comm(&event.comm, sizeof(event.comm));
+
+    event.kind = EXECVE_CALL;
+    bpf_probe_read_user(event.filename, sizeof(event.filename), filename);
+    execve_events.perf_submit(ctx, &event, sizeof(event));
 
     for (u32 i = 0; i < 20; i++) {
         char *argp = NULL;
@@ -97,6 +115,7 @@ int syscall__execve(
             break;
         }
 
+        event.kind = EXECVE_ARG;
         event.argv_index = i;
         // これstrlenとか無しで大丈夫?
         bpf_probe_read_user(event.argv, sizeof(event.argv), argp);
@@ -105,27 +124,121 @@ int syscall__execve(
 
     return 0;
 }
+
+int syscall__execve_ret(struct pt_regs *ctx) {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+    struct execve_event_t event = {};
+    event.ts = bpf_ktime_get_ns();
+    event.pid = task->tgid;
+    event.kind = EXECVE_RETURN;
+    bpf_get_current_comm(&event.comm, sizeof(event.comm));
+
+    event.retval = PT_REGS_RC(ctx);
+    execve_events.perf_submit(ctx, &event, sizeof(event));
+
+    return 0;
+}
 """
 
 
 b = BPF(text=program)
-b.attach_kprobe(event=b.get_syscall_fnname("execve"), fn_name="syscall__execve")
+b.attach_kprobe(event=b.get_syscall_fnname("execve"), fn_name=b"syscall__execve")
+b.attach_kretprobe(event=b.get_syscall_fnname("execve"), fn_name=b"syscall__execve_ret")
 
-kinds = ["EXEC", "EXIT"]
-fmt = "%-18s %-10s %-10s %-6s %-6s %-6s %-32s %-32s"
-print(fmt % ("TIME(s)", "PID", "TGID", "KIND", "CODE", "SIGNAL", "COMM", "FILE NAME"))
 
+@dataclass
+class Execution:
+    pid: int
+    comm: str
+    arguments: Optional[dict[int, str]] = None
+    execve_filename: Optional[str] = None
+    task_filename: Optional[str] = None
+    exit_code: Optional[int] = None
+    exit_signal: Optional[int] = None
+
+    # timestamps
+    execve_ts: Optional[int] = None
+    execve_ret_ts: Optional[int] = None
+    sched_process_exec_ts: Optional[int] = None
+    sched_process_exit_ts: Optional[int] = None
+
+# execveの呼び出し
+execs: dict[int, Execution] = {}
+
+
+EVENT_SCHED_PROCESS_EXEC = 0
+EVENT_SCHED_PROCESS_EXIT = 1
 def print_event(_cpu, data, _size):
     event = b["events"].event(data)
-    exit_code = event.exit_code >> 8
-    signal = event.exit_code & 0b11111111
-    print(fmt % (event.ts, event.pid, event.tgid, kinds[event.kind], exit_code, signal, event.comm.decode("utf-8"), event.filename.decode("utf-8")))
+
+    if event.kind == EVENT_SCHED_PROCESS_EXEC:
+        if event.pid not in execs:
+            execs[event.pid] = Execution(
+                pid=event.pid,
+                comm=event.comm.decode("utf-8", "replace")
+            )
+        execs[event.pid].sched_process_exec_ts = event.ts
+        execs[event.pid].task_filename = event.filename.decode("utf-8")
+    elif event.kind == EVENT_SCHED_PROCESS_EXIT:
+        # 0以外のステータスコードかシグナルで死んだプロセスだけ出力
+        if event.exit_code != 0:
+            if event.pid not in execs:
+                execs[event.pid] = Execution(
+                    pid=event.pid,
+                    comm=event.comm.decode("utf-8", "replace")
+                )
+            execs[event.pid].sched_process_exit_ts = event.ts
+            execs[event.pid].exit_code = event.exit_code >> 8
+            execs[event.pid].exit_signal = event.exit_code & 0b11111111
+            json.dump(asdict(execs[event.pid]), sys.stdout)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        execs.pop(event.pid, None)
+    else:
+        logging.warning("unknown sched event kind: {}", { field: getattr(event, field) for field, _ in event._fields_ })
 
 
+EXECVE_CALL = 0
+EXECVE_ARG = 1
+EXECVE_RETURN = 2
 def print_execve_event(_cpu, data, _size):
     event = b["execve_events"].event(data)
-    fields = { field: getattr(event, field) for field, _ in event._fields_ }
-    print(fields)
+    if event.kind == EXECVE_CALL:
+        if event.pid not in execs:
+            execs[event.pid] = Execution(
+                pid=event.pid,
+                comm=event.comm.decode("utf-8", "replace")
+            )
+        # 最後のexecveの情報でリセットする
+        execs[event.pid].execve_ts = event.ts
+        execs[event.pid].execve_filename = event.filename.decode("utf-8")
+        execs[event.pid].arguments = {}
+    elif event.kind == EXECVE_ARG:
+        if event.pid not in execs:
+            execs[event.pid] = Execution(
+                pid=event.pid,
+                comm=event.comm.decode("utf-8", "replace")
+            )
+        execs[event.pid].arguments[event.argv_index] = event.argv.decode("utf-8", "replace")
+    elif event.kind == EXECVE_RETURN:
+        if event.retval != 0:
+            if event.pid not in execs:
+                execs[event.pid] = Execution(
+                    pid=event.pid,
+                    comm=event.comm.decode("utf-8", "replace")
+                )
+            execs[event.pid].execve_ret_ts = event.ts
+        else:
+            if event.pid not in execs:
+                execs[event.pid] = Execution(
+                    pid=event.pid,
+                    comm=event.comm.decode("utf-8", "replace")
+                )
+            execs[event.pid].execve_ret_ts = event.ts
+    else:
+        logging.warning("unknown execve event kind: {}", { field: getattr(event, field) for field, _ in event._fields_ })
 
 b["events"].open_perf_buffer(print_event)
 b["execve_events"].open_perf_buffer(print_execve_event)
